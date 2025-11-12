@@ -14,12 +14,12 @@ EquirectangularNode::EquirectangularNode()
     // Declare parameters
     declare_parameter("cx_offset", 0.0);
     declare_parameter("cy_offset", 0.0);
-    declare_parameter("crop_size", 960);
+    declare_parameter("crop_size", 480);
     declare_parameter("translation", std::vector<double>{0.0, 0.0, -0.105});
     declare_parameter("rotation_deg", std::vector<double>{-0.5, 0.0, 1.1});
     declare_parameter("gpu", true);
-    declare_parameter("out_width", 1920);
-    declare_parameter("out_height", 960);
+    declare_parameter("out_width", 960);
+    declare_parameter("out_height", 480);
     
     // Load parameters
     loadParameters();
@@ -314,12 +314,15 @@ void EquirectangularNode::imageCallback(const sensor_msgs::msg::Image::SharedPtr
         
         auto start_time = now();
         cv::Mat equirect_img = createEquirectangular(front_img, back_img);
-        
+        // Resize to 480x854 (width x height)
+        cv::Mat resized_img;
+        cv::resize(equirect_img, resized_img, cv::Size(480*2, 480), 0, 0, cv::INTER_AREA);
+
         // Publish result
         cv_bridge::CvImage out_msg;
         out_msg.header = dual_fisheye_msg->header;
         out_msg.encoding = "rgb8";
-        out_msg.image = equirect_img;
+        out_msg.image = resized_img;
         equirect_pub_->publish(*out_msg.toImageMsg());
         
         auto process_time = (now() - start_time).seconds();
