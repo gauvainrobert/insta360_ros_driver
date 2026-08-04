@@ -11,6 +11,7 @@ find_package(rclcpp REQUIRED)
 find_package(camera_info_manager REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(image_transport REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(imu_tools REQUIRED)
@@ -77,6 +78,7 @@ add_executable(equirectangular_cpp src/equirectangular.cpp)
 ament_target_dependencies(equirectangular_cpp
   rclcpp
   cv_bridge
+  sensor_msgs
   OpenCV
 )
 target_link_libraries(equirectangular_cpp ${OpenCV_LIBRARIES})

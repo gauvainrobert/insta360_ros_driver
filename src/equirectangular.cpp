@@ -3,6 +3,7 @@
 #include <cmath>
 #include <thread>
 #include <chrono>
+#include <utility>
 
 EquirectangularNode::EquirectangularNode()
     : Node("equirectangular_node"),
@@ -20,6 +21,7 @@ EquirectangularNode::EquirectangularNode()
     declare_parameter("gpu", true);
     declare_parameter("out_width", 960);
     declare_parameter("out_height", 480);
+    declare_parameter("compressed_topic", "/equirectangular/image/compressed");
     
     // Load parameters
     loadParameters();
@@ -34,16 +36,24 @@ EquirectangularNode::EquirectangularNode()
     
     updateCameraParameters();
     
-    // Configure QoS
-    auto qos = rclcpp::QoS(1).reliable();
-    
-    // Create publishers and subscribers
+    // Input: best-effort, so falling behind the decoder drops frames instead of
+    // queueing stale ones (and never back-pressures the decoder's writer).
+    rclcpp::SensorDataQoS input_qos;
+    input_qos.keep_last(1);
     dual_fisheye_sub_ = create_subscription<sensor_msgs::msg::Image>(
-        "/dual_fisheye/image", qos,
+        "/dual_fisheye/image", input_qos,
         std::bind(&EquirectangularNode::imageCallback, this, std::placeholders::_1));
-    
+
     equirect_pub_ = create_publisher<sensor_msgs::msg::Image>(
-        "/equirectangular/image", qos);
+        "/equirectangular/image", rclcpp::SensorDataQoS());
+
+    // Keep the existing reliable contract used by image_transport/rqt, but
+    // retain only the newest compressed frame. The old raw->compressed
+    // republisher used reliable depth 10 and could replay that backlog.
+    rclcpp::QoS compressed_qos(1);
+    compressed_qos.reliable();
+    compressed_pub_ = create_publisher<sensor_msgs::msg::CompressedImage>(
+        get_parameter("compressed_topic").as_string(), compressed_qos);
 }
 
 EquirectangularNode::~EquirectangularNode()
@@ -246,8 +256,8 @@ cv::Mat EquirectangularNode::createEquirectangular(const cv::Mat& front_img, con
     }
     
     cv::Mat front_result, back_result;
-    cv::remap(front_img, front_result, front_map_x_, front_map_y_, cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
-    cv::remap(back_img, back_result, back_map_x_, back_map_y_, cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+    cv::remap(front_img, front_result, front_map_x_, front_map_y_, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+    cv::remap(back_img, back_result, back_map_x_, back_map_y_, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
     
     cv::Mat equirect = cv::Mat::zeros(out_height_, out_width_, CV_8UC3);
     
@@ -266,8 +276,8 @@ void EquirectangularNode::imageCallback(const sensor_msgs::msg::Image::SharedPtr
 {
     
     try {
-        cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(dual_fisheye_msg, "rgb8");
-        cv::Mat dual_fisheye_img = cv_ptr->image;
+        cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(dual_fisheye_msg, "bgr8");
+        const cv::Mat& dual_fisheye_img = cv_ptr->image;
         
         int img_height = dual_fisheye_img.rows;
         int img_width_full = dual_fisheye_img.cols;
@@ -314,16 +324,20 @@ void EquirectangularNode::imageCallback(const sensor_msgs::msg::Image::SharedPtr
         
         auto start_time = now();
         cv::Mat equirect_img = createEquirectangular(front_img, back_img);
-        // Resize to 480x854 (width x height)
-        cv::Mat resized_img;
-        cv::resize(equirect_img, resized_img, cv::Size(480*2, 480), 0, 0, cv::INTER_AREA);
 
-        // Publish result
-        cv_bridge::CvImage out_msg;
-        out_msg.header = dual_fisheye_msg->header;
-        out_msg.encoding = "rgb8";
-        out_msg.image = resized_img;
-        equirect_pub_->publish(*out_msg.toImageMsg());
+        if (equirect_pub_->get_subscription_count() > 0) {
+            cv_bridge::CvImage out_msg(dual_fisheye_msg->header, "bgr8", equirect_img);
+            equirect_pub_->publish(*out_msg.toImageMsg());
+        }
+
+        std::vector<uchar> jpeg;
+        if (cv::imencode(".jpg", equirect_img, jpeg, {cv::IMWRITE_JPEG_QUALITY, 70})) {
+            sensor_msgs::msg::CompressedImage compressed;
+            compressed.header = dual_fisheye_msg->header;
+            compressed.format = "rgb8; jpeg compressed bgr8";
+            compressed.data = std::move(jpeg);
+            compressed_pub_->publish(std::move(compressed));
+        }
         
         auto process_time = (now() - start_time).seconds();
         RCLCPP_DEBUG(get_logger(), "Processing time: %.3f seconds", process_time);

@@ -18,6 +18,8 @@ private:
     std::shared_ptr<rclcpp::Node> node_;
     rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr compressed_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
+    std::vector<uint8_t> sps_;
+    std::vector<uint8_t> pps_;
 
 public:
     TestStreamDelegate(const std::shared_ptr<rclcpp::Node>& node) : node_(node) {
@@ -39,6 +41,43 @@ public:
     void OnVideoData(const uint8_t* data, size_t size, int64_t timestamp, uint8_t streamType, int stream_index) override {
         // We only care about the main video stream (index 0)
         if (stream_index == 0 && size > 0 && compressed_pub_) {
+            bool has_parameter_set = false;
+            for (size_t offset = 0; offset + 3 < size;) {
+                size_t prefix = 0;
+                if (offset + 4 <= size && data[offset] == 0 && data[offset + 1] == 0 &&
+                    data[offset + 2] == 0 && data[offset + 3] == 1) {
+                    prefix = 4;
+                } else if (data[offset] == 0 && data[offset + 1] == 0 && data[offset + 2] == 1) {
+                    prefix = 3;
+                } else {
+                    ++offset;
+                    continue;
+                }
+
+                const size_t nal_start = offset + prefix;
+                size_t nal_end = size;
+                for (size_t next = nal_start; next + 3 < size; ++next) {
+                    if ((data[next] == 0 && data[next + 1] == 0 && data[next + 2] == 1) ||
+                        (next + 4 <= size && data[next] == 0 && data[next + 1] == 0 &&
+                         data[next + 2] == 0 && data[next + 3] == 1)) {
+                        nal_end = next;
+                        break;
+                    }
+                }
+
+                if (nal_start < nal_end) {
+                    const uint8_t nal_type = data[nal_start] & 0x1f;
+                    if (nal_type == 7) {
+                        sps_.assign(data + offset, data + nal_end);
+                        has_parameter_set = true;
+                    } else if (nal_type == 8) {
+                        pps_.assign(data + offset, data + nal_end);
+                        has_parameter_set = true;
+                    }
+                }
+                offset = nal_end;
+            }
+
             auto msg = std::make_unique<sensor_msgs::msg::CompressedImage>();
 
             // Set the header
@@ -49,8 +88,16 @@ public:
             // The subscriber will need to know this to select the correct decoder.
             msg->format = "h264";
 
-            // Copy the compressed video data directly into the message
-            msg->data.assign(data, data + size);
+            // Late subscribers need the codec headers that were sent before
+            // they connected. Repeat cached SPS/PPS until the next keyframe.
+            if (!has_parameter_set && !sps_.empty() && !pps_.empty()) {
+                msg->data.reserve(sps_.size() + pps_.size() + size);
+                msg->data.insert(msg->data.end(), sps_.begin(), sps_.end());
+                msg->data.insert(msg->data.end(), pps_.begin(), pps_.end());
+                msg->data.insert(msg->data.end(), data, data + size);
+            } else {
+                msg->data.assign(data, data + size);
+            }
 
             compressed_pub_->publish(std::move(msg));
         }

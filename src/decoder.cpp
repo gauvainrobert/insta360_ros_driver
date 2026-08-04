@@ -48,32 +48,46 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr subscription_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr publisher_;
 
+    struct QueuedFrame {
+        std::unique_ptr<sensor_msgs::msg::Image> message;
+    };
+
     std::thread publisher_thread_;
-    std::queue<cv::Mat> frame_publish_queue_;
+    std::queue<QueuedFrame> frame_publish_queue_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::atomic<bool> stop_publisher_thread_{false};
-    size_t max_queue_size_ = 10;
-    
+    // Keep only the newest decoded frame; stale video is not useful downstream.
+    size_t max_queue_size_ = 1;
+    rclcpp::Time current_stamp_;
+
     int skip_frame_ = 0;
     int frame_counter_ = 0;
     bool i_frame_only_ = false;
+    bool use_hw_ = false;
 
     void InitFFmpegDecoder() {
-        hw_type_ = AV_HWDEVICE_TYPE_CUDA;
-        const char* decoder_name = "h264_cuvid";
+        if (use_hw_) {
+            hw_type_ = AV_HWDEVICE_TYPE_CUDA;
+            const char* decoder_name = "h264_cuvid";
 
-        codec_ = avcodec_find_decoder_by_name(decoder_name);
+            codec_ = avcodec_find_decoder_by_name(decoder_name);
+            if (!codec_) {
+                RCLCPP_WARN(this->get_logger(), "Hardware decoder not available, falling back to software");
+                hw_type_ = AV_HWDEVICE_TYPE_NONE;
+            } else {
+                RCLCPP_INFO(this->get_logger(), "Using hardware H.264 decoder (NVDEC)");
+            }
+        }
+
         if (!codec_) {
-            RCLCPP_WARN(this->get_logger(), "Hardware decoder not available, falling back to software");
             hw_type_ = AV_HWDEVICE_TYPE_NONE;
             codec_ = avcodec_find_decoder(AV_CODEC_ID_H264);
             if (!codec_) {
                 RCLCPP_ERROR(this->get_logger(), "No H.264 decoder available");
                 return;
             }
-        } else {
-            RCLCPP_INFO(this->get_logger(), "Using hardware H.264 decoder (NVDEC)");
+            RCLCPP_INFO(this->get_logger(), "Using software H.264 decoder");
         }
 
         if (hw_type_ != AV_HWDEVICE_TYPE_NONE) {
@@ -135,7 +149,7 @@ private:
 
     void PublisherThreadLoop() {
         while (!stop_publisher_thread_) {
-            cv::Mat frame_to_publish;
+            QueuedFrame frame_to_publish;
             {
                 std::unique_lock<std::mutex> lock(queue_mutex_);
                 queue_cv_.wait(lock, [this] {
@@ -148,18 +162,12 @@ private:
                 if (frame_publish_queue_.empty()) {
                     continue;
                 }
-                frame_to_publish = frame_publish_queue_.front();
+                frame_to_publish = std::move(frame_publish_queue_.front());
                 frame_publish_queue_.pop();
             }
 
-            if (!frame_to_publish.empty() && publisher_) {
-                auto img_msg = std::make_unique<sensor_msgs::msg::Image>();
-                std_msgs::msg::Header header;
-                header.stamp = this->get_clock()->now();
-                header.frame_id = "camera_frame";
-                cv_bridge::CvImage cv_image(header, sensor_msgs::image_encodings::BGR8, frame_to_publish);
-                cv_image.toImageMsg(*img_msg);
-                publisher_->publish(std::move(img_msg));
+            if (frame_to_publish.message && publisher_) {
+                publisher_->publish(std::move(frame_to_publish.message));
             }
         }
     }
@@ -220,12 +228,24 @@ private:
                 }
                 
                 if (should_publish) {
-                    cv::Mat frame_copy = bgr_frame_.clone();
+                    auto img_msg = std::make_unique<sensor_msgs::msg::Image>();
+                    std_msgs::msg::Header header;
+                    header.stamp = current_stamp_;
+                    header.frame_id = "camera_frame";
+                    cv_bridge::CvImage cv_image(header, sensor_msgs::image_encodings::BGR8, bgr_frame_);
+                    cv_image.toImageMsg(*img_msg);
+                    QueuedFrame queued{std::move(img_msg)};
                     {
                         std::lock_guard<std::mutex> lock(queue_mutex_);
-                        if (frame_publish_queue_.size() < max_queue_size_) {
-                            frame_publish_queue_.push(frame_copy);
+                        // Drop the OLDEST, never the newest. Dropping the newest
+                        // keeps a full queue of stale frames forever once the
+                        // publisher falls behind - the display then runs a fixed
+                        // queue-length behind reality and lurches whenever the
+                        // backlog drains.
+                        while (frame_publish_queue_.size() >= max_queue_size_) {
+                            frame_publish_queue_.pop();
                         }
+                        frame_publish_queue_.push(std::move(queued));
                     }
                     queue_cv_.notify_one();
                 }
@@ -280,6 +300,9 @@ private:
             return;
         }
 
+        // Carried through the decode + publish queue onto the output header.
+        current_stamp_ = rclcpp::Time(msg->header.stamp);
+
         const uint8_t* cur_data = msg->data.data();
         size_t remaining_size = msg->data.size();
 
@@ -310,22 +333,31 @@ private:
     }
 
 public:
-    H264DecoderNode() : Node("h264_decoder_node") {
+    H264DecoderNode() : Node("h264_decoder_node"), current_stamp_(0, 0, RCL_ROS_TIME) {
         this->declare_parameter("compressed_topic", "/dual_fisheye/image/compressed");
         this->declare_parameter("uncompressed_topic", "/dual_fisheye/image");
         this->declare_parameter("skip_frame", 0);
         this->declare_parameter("i_frame_only", false);
+        this->declare_parameter("use_hw", false);
 
         std::string subscribe_topic = this->get_parameter("compressed_topic").as_string();
         std::string publish_topic = this->get_parameter("uncompressed_topic").as_string();
         skip_frame_ = this->get_parameter("skip_frame").as_int();
         i_frame_only_ = this->get_parameter("i_frame_only").as_bool();
+        use_hw_ = this->get_parameter("use_hw").as_bool();
 
+        // Input stays RELIABLE on purpose: h264 is a stateful stream, a dropped
+        // packet corrupts decoding until the next I-frame.
         subscription_ = this->create_subscription<sensor_msgs::msg::CompressedImage>(
             subscribe_topic, 10,
             std::bind(&H264DecoderNode::compressed_image_callback, this, std::placeholders::_1));
 
-        publisher_ = this->create_publisher<sensor_msgs::msg::Image>(publish_topic, 10);
+        // Output is BEST_EFFORT: decoded frames are self-contained and stale ones
+        // are worthless. A reliable writer of multi-MB images blocks in publish()
+        // for up to max_blocking_time whenever the reader lags, which is what fed
+        // the backlog above.
+        publisher_ = this->create_publisher<sensor_msgs::msg::Image>(
+            publish_topic, rclcpp::SensorDataQoS());
 
         publisher_thread_ = std::thread(&H264DecoderNode::PublisherThreadLoop, this);
         
@@ -335,6 +367,7 @@ public:
         RCLCPP_INFO(this->get_logger(), "Subscribing to: %s", subscribe_topic.c_str());
         RCLCPP_INFO(this->get_logger(), "Publishing to: %s", publish_topic.c_str());
         RCLCPP_INFO(this->get_logger(), "Skip frame: %d, I-frame only: %s", skip_frame_, i_frame_only_ ? "true" : "false");
+        RCLCPP_INFO(this->get_logger(), "Hardware decoding: %s", use_hw_ ? "true" : "false");
     }
 
     ~H264DecoderNode() {

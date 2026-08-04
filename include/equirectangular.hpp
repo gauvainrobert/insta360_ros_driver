@@ -2,6 +2,7 @@
 #define EQUIRECTANGULAR_HPP
 
 #include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/opencv.hpp>
@@ -31,6 +32,7 @@ private:
     // ROS2 communication
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr dual_fisheye_sub_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr equirect_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr compressed_pub_;
     
     // Parameters
     double cx_offset_;
