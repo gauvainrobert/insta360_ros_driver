@@ -59,6 +59,7 @@ private:
     std::atomic<bool> stop_publisher_thread_{false};
     // Keep only the newest decoded frame; stale video is not useful downstream.
     size_t max_queue_size_ = 1;
+    bool stamp_on_receive_ = false;
     rclcpp::Time current_stamp_;
 
     int skip_frame_ = 0;
@@ -301,7 +302,7 @@ private:
         }
 
         // Carried through the decode + publish queue onto the output header.
-        current_stamp_ = rclcpp::Time(msg->header.stamp);
+        current_stamp_ = stamp_on_receive_ ? this->now() : rclcpp::Time(msg->header.stamp);
 
         const uint8_t* cur_data = msg->data.data();
         size_t remaining_size = msg->data.size();
@@ -339,12 +340,23 @@ public:
         this->declare_parameter("skip_frame", 0);
         this->declare_parameter("i_frame_only", false);
         this->declare_parameter("use_hw", false);
+        // true: stamp decoded frames with THIS machine's clock at receipt
+        // instead of the NUC's capture stamp. The NUC clock drifts (measured
+        // seconds per hour) and every downstream freshness gate compares
+        // stamps against this machine's clock - a skewed capture stamp makes
+        // every frame "stale" and stalls navigation with no error. Costs the
+        // Wi-Fi transport latency (~100s of ms) being invisible in the stamp.
+        this->declare_parameter("stamp_on_receive", false);
 
         std::string subscribe_topic = this->get_parameter("compressed_topic").as_string();
         std::string publish_topic = this->get_parameter("uncompressed_topic").as_string();
         skip_frame_ = this->get_parameter("skip_frame").as_int();
         i_frame_only_ = this->get_parameter("i_frame_only").as_bool();
         use_hw_ = this->get_parameter("use_hw").as_bool();
+        stamp_on_receive_ = this->get_parameter("stamp_on_receive").as_bool();
+        if (stamp_on_receive_) {
+            RCLCPP_INFO(this->get_logger(), "Stamping frames on receive (local clock), not the publisher's capture stamp");
+        }
 
         // Input stays RELIABLE on purpose: h264 is a stateful stream, a dropped
         // packet corrupts decoding until the next I-frame.

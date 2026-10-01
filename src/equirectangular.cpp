@@ -1,6 +1,7 @@
 #include "equirectangular.hpp"
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <cmath>
+#include <stdexcept>
 #include <thread>
 #include <chrono>
 #include <utility>
@@ -22,6 +23,13 @@ EquirectangularNode::EquirectangularNode()
     declare_parameter("out_width", 960);
     declare_parameter("out_height", 480);
     declare_parameter("compressed_topic", "/equirectangular/image/compressed");
+    // Black out the bottom of the panorama (the robot's own body / camera
+    // mount). Must equal the BOTTOM_MASK_FRAC the map was built with
+    // (scripts/real_world/extract_video_frames.py apply_bottom_mask: pixels
+    // set to 0), so live frames match map frames. Applied here, at the
+    // source, so every consumer - VO, localization, depth, recorder, JPEG -
+    // sees the same image.
+    declare_parameter("bottom_mask_frac", 0.0);
     
     // Load parameters
     loadParameters();
@@ -69,6 +77,10 @@ void EquirectangularNode::loadParameters()
         out_width_ = get_parameter("out_width").as_int();
         out_height_ = get_parameter("out_height").as_int();
         gpu_enabled_ = get_parameter("gpu").as_bool();
+        bottom_mask_frac_ = get_parameter("bottom_mask_frac").as_double();
+        if (bottom_mask_frac_ < 0.0 || bottom_mask_frac_ >= 1.0) {
+            throw std::invalid_argument("bottom_mask_frac must be in [0, 1)");
+        }
         
         auto translation = get_parameter("translation").as_double_array();
         tx_ = translation[0];
@@ -88,6 +100,7 @@ void EquirectangularNode::loadParameters()
                     rotation_deg[0], rotation_deg[1], rotation_deg[2]);
         RCLCPP_INFO(get_logger(), "  Output size: %dx%d", out_width_, out_height_);
         RCLCPP_INFO(get_logger(), "  GPU enabled: %s", gpu_enabled_ ? "true" : "false");
+        RCLCPP_INFO(get_logger(), "  Bottom mask: %.0f%%", bottom_mask_frac_ * 100.0);
     } catch (const std::exception& e) {
         RCLCPP_ERROR(get_logger(), "Error loading parameters: %s", e.what());
         gpu_enabled_ = true;
@@ -324,6 +337,12 @@ void EquirectangularNode::imageCallback(const sensor_msgs::msg::Image::SharedPtr
         
         auto start_time = now();
         cv::Mat equirect_img = createEquirectangular(front_img, back_img);
+        if (bottom_mask_frac_ > 0.0) {
+            // Same row as extract_video_frames.py's mask_start_row:
+            // round((1 - frac) * height).
+            int start = static_cast<int>(std::lround((1.0 - bottom_mask_frac_) * equirect_img.rows));
+            equirect_img.rowRange(start, equirect_img.rows).setTo(cv::Scalar::all(0));
+        }
 
         if (equirect_pub_->get_subscription_count() > 0) {
             cv_bridge::CvImage out_msg(dual_fisheye_msg->header, "bgr8", equirect_img);
@@ -362,6 +381,7 @@ rcl_interfaces::msg::SetParametersResult EquirectangularNode::parametersCallback
             param.get_name() == "rotation_deg" ||
             param.get_name() == "out_width" ||
             param.get_name() == "out_height" ||
+            param.get_name() == "bottom_mask_frac" ||
             param.get_name() == "gpu") {
             update_needed = true;
         }

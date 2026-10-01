@@ -43,6 +43,7 @@ private:
     bool gpu_enabled_;
     int out_width_;
     int out_height_;
+    double bottom_mask_frac_;  // bottom fraction blacked out (robot body); 0 = off
     
     // Camera parameters
     double cx_, cy_;

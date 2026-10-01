@@ -7,6 +7,13 @@
     <arg name="imu_config" default="$(find-pkg-share insta360_ros_driver)/config/imu_filter.yaml"/>
     <arg name="compressed_topic" default="/equirectangular/image/compressed"/>
     <arg name="use_hw" default="true"/>
+    <!-- Bottom fraction of the panorama blacked out (robot body). Match the
+         BOTTOM_MASK_FRAC the topograph was built with; 0 = off. -->
+    <arg name="bottom_mask_frac" default="0.0"/>
+    <!-- Stamp decoded frames with this machine's clock (see decoder.cpp). -->
+    <arg name="stamp_on_receive" default="false"/>
+    <!-- Publish only 1 of every (skip_frame+1) decoded frames; 0 = all. -->
+    <arg name="skip_frame" default="0"/>
 
     <!-- Publishes Compressed Images -->
     <node if="$(var camera)" pkg="insta360_ros_driver" exec="insta360_ros_driver" name="insta360_ros_driver" output="log"/>
@@ -16,16 +23,18 @@
         <param name="compressed_topic" value="/dual_fisheye/image/compressed"/>
         <param name="uncompressed_topic" value="/dual_fisheye/image"/>
         <!-- We can skip decoding every <skip_frame>. So skip_frame = 1 will only publish half the frames, etc. -->
-        <param name="skip_frame" value="0"/>
+        <param name="skip_frame" value="$(var skip_frame)"/>
         <!-- If you want to minimize the CPU load the most, you can decode only the i-frames. But the expected FPS is about 1-2 FPS -->
         <param name="i_frame_only" value="false"/> 
         <param name="use_hw" value="$(var use_hw)"/>
+        <param name="stamp_on_receive" value="$(var stamp_on_receive)"/>
     </node>
 
     <!-- Creates Equirectangular Images -->
     <node if="$(var equirectangular)" pkg="insta360_ros_driver" exec="equirectangular_cpp" name="equirectangular_node" output="screen">
         <param from="$(var equirectangular_config)" />
         <param name="compressed_topic" value="$(var compressed_topic)" />
+        <param name="bottom_mask_frac" value="$(var bottom_mask_frac)" />
     </node>
 
     <!-- Applies a Madgwick Filter to the 6-DOF IMU to get Orientation -->
